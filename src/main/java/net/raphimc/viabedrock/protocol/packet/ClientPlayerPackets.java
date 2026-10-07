@@ -17,6 +17,7 @@
  */
 package net.raphimc.viabedrock.protocol.packet;
 
+import com.viaversion.viaversion.api.connection.UserConnection;
 import com.viaversion.viaversion.api.minecraft.BlockPosition;
 import com.viaversion.viaversion.api.minecraft.Vector3d;
 import com.viaversion.viaversion.api.protocol.packet.PacketWrapper;
@@ -47,7 +48,10 @@ import net.raphimc.viabedrock.protocol.data.enums.java.*;
 import net.raphimc.viabedrock.protocol.data.enums.java.generated.*;
 import net.raphimc.viabedrock.protocol.model.Position2f;
 import net.raphimc.viabedrock.protocol.model.Position3f;
+import net.raphimc.viabedrock.protocol.model.inventory.BedrockInventoryTransaction;
+import net.raphimc.viabedrock.protocol.model.inventory.InventoryTransactionData;
 import net.raphimc.viabedrock.protocol.rewriter.GameTypeRewriter;
+import net.raphimc.viabedrock.protocol.rewriter.InventoryTransactionRewriter;
 import net.raphimc.viabedrock.protocol.rewriter.ItemRewriter;
 import net.raphimc.viabedrock.protocol.storage.*;
 import net.raphimc.viabedrock.protocol.types.BedrockTypes;
@@ -58,6 +62,11 @@ import java.util.UUID;
 import java.util.logging.Level;
 
 public final class ClientPlayerPackets {
+
+    /**
+     * The Java client waits 5 ticks after breaking a block before it continues breaking. One more tick is added for the tick the block was broken in.
+     */
+    private static final int BLOCK_BREAKING_COOLDOWN = 6;
 
     private static final PacketHandler CLIENT_PLAYER_GAME_MODE_INFO_UPDATE = wrapper -> {
         final ClientPlayerEntity clientPlayer = wrapper.user().get(EntityTracker.class).getClientPlayer();
@@ -316,19 +325,27 @@ public final class ClientPlayerPackets {
                 return;
             }
 
-            // TODO: Block breaking: Send correct inventory transactions
-
             switch (action) {
                 case START_DESTROY_BLOCK -> {
+                    if (clientPlayer.blockBreakingInfo() != null) {
+                        // The Java client sends ABORT_DESTROY_BLOCK before it starts breaking another block. If it didn't, the previous block was broken instantly.
+                        finishBlockBreaking(wrapper.user(), clientPlayer.blockBreakingInfo().position(), clientPlayer.blockBreakingInfo().direction());
+                        clientPlayer.setBlockBreakingInfo(null);
+                    }
+
                     clientPlayer.sendSwingPacketToServer();
                     clientPlayer.cancelNextSwingPacket();
-                    clientPlayer.setBlockBreakingInfo(new ClientPlayerEntity.BlockBreakingInfo(position, direction));
-                    // TODO: Handle instant breaking
-                    // TODO: Handle creative mode mining
-                    // TODO: Test breaking fire
-                    // TODO: The java client keeps spamming swing packets while waiting for the block break cooldown. Those need to be cancelled
-
                     clientPlayer.addAuthInputBlockAction(new ClientPlayerEntity.AuthInputBlockAction(PlayerActionType.StartDestroyBlock, position, direction.ordinal()));
+                    // TODO: Test breaking fire
+
+                    if (clientPlayer.abilities().getBooleanValue(AbilitiesIndex.Instabuild)) {
+                        // The Java client breaks blocks instantly in creative mode and doesn't send STOP_DESTROY_BLOCK
+                        finishBlockBreaking(wrapper.user(), position, direction);
+                        clientPlayer.setBlockBreakingCooldown(BLOCK_BREAKING_COOLDOWN);
+                    } else {
+                        // If the block breaks instantly, the Java client doesn't send anything else. That is detected in the CLIENT_TICK_END handler.
+                        clientPlayer.setBlockBreakingInfo(new ClientPlayerEntity.BlockBreakingInfo(position, direction));
+                    }
                 }
                 case ABORT_DESTROY_BLOCK -> {
                     clientPlayer.setBlockBreakingInfo(null);
@@ -337,19 +354,8 @@ public final class ClientPlayerPackets {
                 case STOP_DESTROY_BLOCK -> {
                     clientPlayer.cancelNextSwingPacket();
                     clientPlayer.setBlockBreakingInfo(null);
-
-                    if (!gameSession.isBlockBreakingServerAuthoritative()) {
-                        clientPlayer.addAuthInputBlockAction(new ClientPlayerEntity.AuthInputBlockAction(PlayerActionType.StopDestroyBlock));
-                        clientPlayer.addAuthInputBlockAction(new ClientPlayerEntity.AuthInputBlockAction(PlayerActionType.CrackBlock, position, direction.ordinal()));
-                        clientPlayer.addAuthInputBlockAction(new ClientPlayerEntity.AuthInputBlockAction(PlayerActionType.AbortDestroyBlock, position, 0));
-                    } else {
-                        clientPlayer.addAuthInputBlockAction(new ClientPlayerEntity.AuthInputBlockAction(PlayerActionType.ContinueDestroyBlock, position, direction.ordinal()));
-                        clientPlayer.addAuthInputBlockAction(new ClientPlayerEntity.AuthInputBlockAction(PlayerActionType.PredictDestroyBlock, position, direction.ordinal()));
-                        clientPlayer.addAuthInputBlockAction(new ClientPlayerEntity.AuthInputBlockAction(PlayerActionType.AbortDestroyBlock, position, 0));
-                    }
-
-                    chunkTracker.handleBlockChange(position, 0, chunkTracker.bedrockAirId());
-                    PacketFactory.sendJavaBlockUpdate(wrapper.user(), position, ProtocolConstants.JAVA_AIR_ID);
+                    finishBlockBreaking(wrapper.user(), position, direction);
+                    clientPlayer.setBlockBreakingCooldown(BLOCK_BREAKING_COOLDOWN);
                 }
                 case SWAP_ITEM_WITH_OFFHAND, STAB -> {
                 }
@@ -468,8 +474,24 @@ public final class ClientPlayerPackets {
             }
 
             if (!clientPlayer.isInitiallySpawned() || clientPlayer.isDead()) {
+                clientPlayer.setBlockBreakingInfo(null);
                 wrapper.cancel();
                 return;
+            }
+
+            if (clientPlayer.blockBreakingCooldown() > 0) {
+                clientPlayer.setBlockBreakingCooldown(clientPlayer.blockBreakingCooldown() - 1);
+            }
+            final ClientPlayerEntity.BlockBreakingInfo blockBreakingInfo = clientPlayer.blockBreakingInfo();
+            if (blockBreakingInfo != null) {
+                if (blockBreakingInfo.active()) {
+                    blockBreakingInfo.setActive(false);
+                } else {
+                    // The Java client swings every tick while breaking a block and sends STOP_DESTROY_BLOCK or ABORT_DESTROY_BLOCK when it is done.
+                    // If it stayed silent for a whole tick, the block was broken instantly when the client started breaking it.
+                    clientPlayer.setBlockBreakingInfo(null);
+                    finishBlockBreaking(wrapper.user(), blockBreakingInfo.position(), blockBreakingInfo.direction());
+                }
             }
 
             clientPlayer.addAuthInputData(PlayerAuthInputData.BlockBreakingDelayEnabled);
@@ -608,7 +630,15 @@ public final class ClientPlayerPackets {
         protocol.registerServerbound(ServerboundPackets26_3.PUNCH, ServerboundBedrockPackets.ANIMATE, wrapper -> {
             final GameSessionStorage gameSession = wrapper.user().get(GameSessionStorage.class);
             final ClientPlayerEntity clientPlayer = wrapper.user().get(EntityTracker.class).getClientPlayer();
+            if (clientPlayer.blockBreakingInfo() != null) {
+                clientPlayer.blockBreakingInfo().setActive(true);
+            }
             if (clientPlayer.checkCancelSwingPacket()) {
+                wrapper.cancel();
+                return;
+            }
+            if (clientPlayer.blockBreakingInfo() == null && clientPlayer.blockBreakingCooldown() > 0) {
+                // The Java client keeps swinging while it waits for the block breaking cooldown. These would otherwise be sent as missed swings.
                 wrapper.cancel();
                 return;
             }
@@ -627,6 +657,52 @@ public final class ClientPlayerPackets {
                 clientPlayer.addAuthInputData(PlayerAuthInputData.MissedSwing);
             }
         });
+    }
+
+    private static void finishBlockBreaking(final UserConnection user, final BlockPosition position, final Direction direction) {
+        final GameSessionStorage gameSession = user.get(GameSessionStorage.class);
+        final ClientPlayerEntity clientPlayer = user.get(EntityTracker.class).getClientPlayer();
+        final ChunkTracker chunkTracker = user.get(ChunkTracker.class);
+
+        if (!gameSession.isBlockBreakingServerAuthoritative()) {
+            clientPlayer.addAuthInputBlockAction(new ClientPlayerEntity.AuthInputBlockAction(PlayerActionType.StopDestroyBlock));
+            clientPlayer.addAuthInputBlockAction(new ClientPlayerEntity.AuthInputBlockAction(PlayerActionType.CrackBlock, position, direction.ordinal()));
+            clientPlayer.addAuthInputBlockAction(new ClientPlayerEntity.AuthInputBlockAction(PlayerActionType.AbortDestroyBlock, position, 0));
+
+            // Without server authoritative block breaking the block is destroyed using an item use transaction
+            final InventoryContainer inventoryContainer = user.get(InventoryTracker.class).getInventoryContainer();
+            final InventoryTransactionRewriter inventoryTransactionRewriter = user.get(InventoryTransactionRewriter.class);
+            final BedrockInventoryTransaction inventoryTransaction = new BedrockInventoryTransaction(
+                0, // legacy request id
+                null,
+                null,
+                ComplexInventoryTransaction_Type.ItemUseTransaction,
+                new InventoryTransactionData.UseItemTransactionData(
+                    ItemUseActionType.Destroy,
+                    ItemUseTriggerType.Player_Input,
+                    position,
+                    direction.ordinal(),
+                    inventoryContainer.getSelectedHotbarSlot(),
+                    HandSlot.Mainhand,
+                    inventoryContainer.getSelectedHotbarItem(),
+                    clientPlayer.position(),
+                    Position3f.ZERO, // click position
+                    chunkTracker.getBlockState(position),
+                    ItemUsePredictedResult.Success,
+                    ItemUseClientCooldownState.Off
+                )
+            );
+            final PacketWrapper transactionPacket = PacketWrapper.create(ServerboundBedrockPackets.INVENTORY_TRANSACTION, user);
+            transactionPacket.write(inventoryTransactionRewriter.getInventoryTransactionType(), inventoryTransaction);
+            transactionPacket.sendToServer(BedrockProtocol.class);
+        } else {
+            clientPlayer.addAuthInputBlockAction(new ClientPlayerEntity.AuthInputBlockAction(PlayerActionType.ContinueDestroyBlock, position, direction.ordinal()));
+            clientPlayer.addAuthInputBlockAction(new ClientPlayerEntity.AuthInputBlockAction(PlayerActionType.PredictDestroyBlock, position, direction.ordinal()));
+            clientPlayer.addAuthInputBlockAction(new ClientPlayerEntity.AuthInputBlockAction(PlayerActionType.AbortDestroyBlock, position, 0));
+        }
+
+        chunkTracker.handleBlockChange(position, 0, chunkTracker.bedrockAirId());
+        PacketFactory.sendJavaBlockUpdate(user, position, ProtocolConstants.JAVA_AIR_ID);
     }
 
     private ClientPlayerPackets() {

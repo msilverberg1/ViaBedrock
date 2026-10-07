@@ -84,6 +84,7 @@ public class ClientPlayerEntity extends PlayerEntity {
     private GameMode javaGameMode;
     private boolean cancelNextSwingPacket;
     private BlockBreakingInfo blockBreakingInfo;
+    private int blockBreakingCooldown;
 
     public ClientPlayerEntity(final UserConnection user, final long runtimeId, final UUID javaUuid, final PlayerAbilities abilities) {
         super(user, runtimeId, 1, javaUuid, abilities);
@@ -449,6 +450,14 @@ public class ClientPlayerEntity extends PlayerEntity {
         this.blockBreakingInfo = blockBreakingInfo;
     }
 
+    public int blockBreakingCooldown() {
+        return this.blockBreakingCooldown;
+    }
+
+    public void setBlockBreakingCooldown(final int blockBreakingCooldown) {
+        this.blockBreakingCooldown = blockBreakingCooldown;
+    }
+
     public void setRequestedDismount(final boolean requestedDismount) {
         this.requestedDismount = requestedDismount;
     }
@@ -541,7 +550,36 @@ public class ClientPlayerEntity extends PlayerEntity {
     public record DimensionChangeInfo(Long loadingScreenId) {
     }
 
-    public record BlockBreakingInfo(BlockPosition position, Direction direction) {
+    public static final class BlockBreakingInfo {
+
+        private final BlockPosition position;
+        private final Direction direction;
+        private boolean active = true;
+
+        public BlockBreakingInfo(final BlockPosition position, final Direction direction) {
+            this.position = position;
+            this.direction = direction;
+        }
+
+        public BlockPosition position() {
+            return this.position;
+        }
+
+        public Direction direction() {
+            return this.direction;
+        }
+
+        /**
+         * @return Whether the Java client sent anything related to this block breaking since the last tick
+         */
+        public boolean active() {
+            return this.active;
+        }
+
+        public void setActive(final boolean active) {
+            this.active = active;
+        }
+
     }
 
     public record AuthInputBlockAction(PlayerActionType action, BlockPosition position, int direction) {
